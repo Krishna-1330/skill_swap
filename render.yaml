@@ -1,0 +1,33 @@
+# Render creates the API and website from this file.
+services:
+  - type: web
+    name: skillswap-api
+    runtime: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MONGODB_URI
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+
+  - type: web
+    name: skillswap-site
+    runtime: static
+    buildCommand: npm ci && npm run build
+    staticPublishPath: ./dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      # Use the public API URL when the frontend is built for Render.
+      - key: VITE_API_URL
+        fromService:
+          type: web
+          name: skillswap-api
+          envVarKey: RENDER_EXTERNAL_URL
