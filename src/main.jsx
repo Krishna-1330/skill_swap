@@ -1,9 +1,10 @@
-import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
+import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { BrowserRouter, Link, Navigate, Route, Routes, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { ArrowRight, Bell, BookOpen, Check, ChevronDown, Compass, GraduationCap, Handshake, Home, LogOut, Menu, Search, Settings, Sparkles, Users, X } from 'lucide-react';
+import { ArrowRight, Bell, BookOpen, Check, ChevronDown, Compass, FileText, GraduationCap, Handshake, Home, LogOut, Menu, MessageCircle, Search, Send, Settings, Sparkles, Trash2, Users, X } from 'lucide-react';
 import api, { messageFrom } from './api.js';
 import './styles.css';
+import './chat.css';
 
 const AuthContext = createContext(null);
 const useAuth = () => useContext(AuthContext);
@@ -26,7 +27,7 @@ function Protected({ children }) {
 }
 
 const navItems = [
-  ['/app', Home, 'Home'], ['/discover', Compass, 'Discover'], ['/friends', Users, 'Friends'], ['/requests', Handshake, 'Requests'], ['/exchanges', BookOpen, 'Exchanges'], ['/notifications', Bell, 'Notifications']
+  ['/app', Home, 'Home'], ['/discover', Compass, 'Discover'], ['/friends', Users, 'Friends'], ['/chats', MessageCircle, 'Chats'], ['/requests', Handshake, 'Requests'], ['/exchanges', BookOpen, 'Exchanges'], ['/notifications', Bell, 'Notifications']
 ];
 
 function Avatar({ user, size = 'normal' }) {
@@ -93,7 +94,7 @@ function UserCard({ person, onRemove }) {
     <div className="skill-block"><label>CAN TEACH</label><SkillTags skills={person.skillsKnown} /></div>
     <div className="skill-block"><label>WANTS TO LEARN</label><SkillTags skills={person.skillsLearning} tone="learn" /></div>
     {notice && <div className="inline-error">{notice}</div>}
-    <div className="person-actions"><Link className="button button-light button-small" to={`/profile/${person._id}`}>View profile</Link>{onRemove ? <button className="button button-light button-small" onClick={() => onRemove(person)}>Remove</button> : status === 'None' || status === 'Rejected' ? <button className="button button-primary button-small" onClick={connect} disabled={busy}>{busy ? 'Sending…' : status === 'Rejected' ? 'Connect again' : 'Connect'}</button> : <button className="button button-muted button-small" disabled>{status === 'Accepted' ? 'Connected' : status === 'Pending' ? sentByMe ? 'Request sent' : 'Request received' : status}</button>}</div>
+    <div className="person-actions"><Link className="button button-light button-small" to={`/profile/${person._id}`}>View profile</Link>{status === 'Accepted' && <Link className="button button-light button-small" to={`/chats/${person._id}`}><MessageCircle size={13} /> Chat</Link>}{onRemove ? <button className="button button-light button-small" onClick={() => onRemove(person)}>Remove</button> : status === 'None' || status === 'Rejected' ? <button className="button button-primary button-small" onClick={connect} disabled={busy}>{busy ? 'Sending…' : status === 'Rejected' ? 'Connect again' : 'Connect'}</button> : <button className="button button-muted button-small" disabled>{status === 'Accepted' ? 'Connected' : status === 'Pending' ? sentByMe ? 'Request sent' : 'Request received' : status}</button>}</div>
   </article>;
 }
 
@@ -219,6 +220,159 @@ function Exchanges() {
   return <Layout active="/exchanges"><PageTitle eyebrow="LEARN BY SHARING" title="Skill exchanges" subtitle="Agree on a skill swap, then learn something together." action={<Link className="button button-primary" to="/discover"><Compass size={16} /> Find a skill match</Link>} /><Notice error={error} />{busy ? <div className="loading-line"><div className="spinner" /> Loading exchanges…</div> : <div className="request-columns"><section className="content-panel"><div className="section-heading"><div><h2>Received</h2><p>{received.length} exchange requests</p></div></div>{received.length ? received.map((item) => card(item, true)) : <Empty icon={BookOpen} title="No incoming exchanges">When someone suggests a skill swap, you’ll see it here.</Empty>}</section><section className="content-panel"><div className="section-heading"><div><h2>Sent</h2><p>{sent.length} exchange requests</p></div></div>{sent.length ? sent.map((item) => card(item, false)) : <Empty icon={Sparkles} title="No exchanges yet">Find someone who wants to learn a skill you know.</Empty>}</section></div>}</Layout>;
 }
 
+function Chats() {
+  const { userId } = useParams();
+  const { user } = useAuth();
+  const navigate = useNavigate();
+  const [friends, setFriends] = useState([]);
+  const [messages, setMessages] = useState([]);
+  const [text, setText] = useState('');
+  const [file, setFile] = useState(null);
+  const [error, setError] = useState('');
+  const [loadingFriends, setLoadingFriends] = useState(true);
+  const [loadingMessages, setLoadingMessages] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [chatVersion, setChatVersion] = useState(0);
+  const historyRef = useRef(null);
+  const shouldScrollRef = useRef(true);
+  const activeFriend = friends.find((person) => person._id === userId);
+
+  useEffect(() => {
+    let active = true;
+    api.get('/chats').then(({ data }) => { if (active) setFriends(data.friends); })
+      .catch((e) => { if (active) setError(messageFrom(e)); })
+      .finally(() => { if (active) setLoadingFriends(false); });
+    return () => { active = false; };
+  }, [userId, chatVersion]);
+
+  // Refresh an open conversation every few seconds so new replies appear without reloading.
+  useEffect(() => {
+    if (!userId) { setMessages([]); setLoadingMessages(false); return undefined; }
+    setMessages([]);
+    setLoadingMessages(true);
+    shouldScrollRef.current = true;
+    let active = true;
+    const refresh = (showLoading = false) => {
+      if (showLoading) setLoadingMessages(true);
+      api.get(`/chats/${userId}/messages`).then(({ data }) => {
+        if (active) { setMessages(data.messages); setError(''); }
+      }).catch((e) => { if (active) setError(messageFrom(e)); })
+        .finally(() => { if (active && showLoading) setLoadingMessages(false); });
+    };
+    refresh(true);
+    const timer = window.setInterval(() => refresh(), 5000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [userId]);
+
+  useEffect(() => {
+    if (historyRef.current && shouldScrollRef.current) historyRef.current.scrollTop = historyRef.current.scrollHeight;
+  }, [messages, userId]);
+
+  const trackHistoryScroll = () => {
+    const node = historyRef.current;
+    if (node) shouldScrollRef.current = node.scrollHeight - node.scrollTop - node.clientHeight < 90;
+  };
+
+  const choosePdf = (event) => {
+    const selected = event.target.files?.[0];
+    event.target.value = '';
+    if (!selected) return;
+    if (!selected.name.toLowerCase().endsWith('.pdf') || selected.type && selected.type !== 'application/pdf') {
+      setError('Please choose a PDF file.'); return;
+    }
+    if (selected.size > 8 * 1024 * 1024) { setError('PDF files must be 8 MB or smaller.'); return; }
+    setError(''); setFile(selected);
+  };
+
+  const send = async (event) => {
+    event.preventDefault();
+    if (!activeFriend || (!text.trim() && !file)) return;
+    setSending(true); setError('');
+    try {
+      let pdf;
+      if (file) {
+        const dataUrl = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = () => reject(new Error('The PDF could not be read.'));
+          reader.readAsDataURL(file);
+        });
+        pdf = { name: file.name, base64: String(dataUrl).split(',')[1] };
+      }
+      const { data } = await api.post(`/chats/${userId}/messages`, { text, pdf });
+      setMessages((current) => [...current, data.message]);
+      setText(''); setFile(null); setChatVersion((version) => version + 1);
+    } catch (e) { setError(messageFrom(e)); }
+    finally { setSending(false); }
+  };
+
+  const removeMessage = async (message) => {
+    if (!window.confirm('Delete this message from your chat?')) return;
+    try {
+      await api.delete(`/chats/${userId}/messages/${message._id}`);
+      setMessages((current) => current.filter((item) => item._id !== message._id));
+      setChatVersion((version) => version + 1);
+    } catch (e) { setError(messageFrom(e)); }
+  };
+
+  const clearHistory = async () => {
+    if (!window.confirm('Clear this chat history from your view? The other student will keep their copy.')) return;
+    try {
+      await api.delete(`/chats/${userId}`);
+      setMessages([]); setChatVersion((version) => version + 1);
+    } catch (e) { setError(messageFrom(e)); }
+  };
+
+  const downloadPdf = async (message) => {
+    try {
+      const { data } = await api.get(`/chats/${userId}/files/${message._id}`, { responseType: 'blob' });
+      const url = URL.createObjectURL(data);
+      const link = document.createElement('a');
+      link.href = url; link.download = message.pdf.name; link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (e) { setError(messageFrom(e)); }
+  };
+
+  return <Layout active="/chats"><PageTitle eyebrow="LEARN TOGETHER" title="Chats" subtitle="Share explanations, questions, and PDF notes with your connections." />
+    <Notice error={error} />
+    <div className="chat-layout">
+      <section className="chat-people content-panel">
+        <div className="section-heading"><div><h2>Your connections</h2><p>Choose a student to open a chat.</p></div></div>
+        {loadingFriends ? <div className="loading-line"><div className="spinner" /> Loading chats…</div> : friends.length ? friends.map((person) => <button key={person._id} className={`chat-person ${person._id === userId ? 'selected' : ''}`} onClick={() => navigate(`/chats/${person._id}`)}>
+          <Avatar user={person} size="small" /><span className="chat-person-copy"><b>{person.name}</b><small>{person.lastMessage || 'Start sharing knowledge'}</small></span>{person.lastMessageAt && <time>{new Date(person.lastMessageAt).toLocaleDateString()}</time>}
+        </button>) : <Empty icon={Users} title="No connections yet">Connect with a student first, then start a private chat.</Empty>}
+      </section>
+
+      <section className="chat-window content-panel">
+        {activeFriend ? <>
+          <header className="chat-header"><Avatar user={activeFriend} size="small" /><div><b>{activeFriend.name}</b><span>Private knowledge sharing</span></div><button className="button button-light button-small" onClick={clearHistory} disabled={!messages.length}><Trash2 size={13} /> Clear history</button></header>
+          <div className="chat-history" ref={historyRef} onScroll={trackHistoryScroll}>
+            {loadingMessages ? <div className="loading-line"><div className="spinner" /> Loading messages…</div> : messages.length ? messages.map((message) => {
+              const mine = String(message.senderId) === String(user?._id);
+              return <article className={`chat-bubble-row ${mine ? 'mine' : ''}`} key={message._id}>
+                <div className="chat-bubble">
+                  {message.text && <p>{message.text}</p>}
+                  {message.pdf && <button className="chat-pdf" onClick={() => downloadPdf(message)}><FileText size={18} /><span><b>{message.pdf.name}</b><small>{(message.pdf.size / (1024 * 1024)).toFixed(2)} MB · Download PDF</small></span></button>}
+                  <footer><time>{new Date(message.createdAt).toLocaleString()}</time><button onClick={() => removeMessage(message)} aria-label="Delete message for me" title="Delete for me"><Trash2 size={13} /></button></footer>
+                </div>
+              </article>;
+            }) : <Empty icon={MessageCircle} title="Start a learning chat">Ask a question, explain a skill, or share a PDF to help each other learn.</Empty>}
+          </div>
+          <form className="chat-compose" onSubmit={send}>
+            <textarea value={text} onChange={(event) => setText(event.target.value)} maxLength="5000" rows="3" placeholder={`Write a message to ${activeFriend.name}…`} aria-label="Chat message" />
+            <div className="chat-compose-actions">
+              <label className="button button-light button-small"><FileText size={14} /> Attach PDF<input type="file" accept="application/pdf,.pdf" onChange={choosePdf} hidden /></label>
+              {file && <span className="chat-selected-file">{file.name}<button type="button" onClick={() => setFile(null)} aria-label="Remove attached PDF"><X size={13} /></button></span>}
+              <button className="button button-primary button-small" disabled={sending || (!text.trim() && !file)}>{sending ? 'Sending…' : 'Send'} <Send size={13} /></button>
+            </div>
+            <small>PDF files up to 8 MB are saved with the chat history.</small>
+          </form>
+        </> : <div className="chat-no-selection"><MessageCircle size={30} /><h2>Choose a student</h2><p>Your messages and shared PDFs will appear here.</p></div>}
+      </section>
+    </div>
+  </Layout>;
+}
+
 function Notifications() {
   const [items, setItems] = useState([]); const [error, setError] = useState(''); const [busy, setBusy] = useState(true);
   const reload = () => api.get('/notifications').then(({ data }) => setItems(data.notifications)).catch((e) => setError(messageFrom(e))).finally(() => setBusy(false));
@@ -228,7 +382,7 @@ function Notifications() {
 }
 
 function App() {
-  return <AuthProvider><Routes><Route path="/" element={<Landing />} /><Route path="/signup" element={<AuthPage mode="signup" />} /><Route path="/signin" element={<AuthPage mode="signin" />} /><Route path="/app" element={<Protected><Dashboard /></Protected>} /><Route path="/discover" element={<Protected><SearchPeople /></Protected>} /><Route path="/search" element={<Protected><SearchPeople /></Protected>} /><Route path="/profile/:id" element={<Protected><Profile /></Protected>} /><Route path="/my-profile" element={<Protected><Profile own /></Protected>} /><Route path="/edit-profile" element={<Protected><EditProfile /></Protected>} /><Route path="/friends" element={<Protected><Friends /></Protected>} /><Route path="/requests" element={<Protected><ConnectionRequests /></Protected>} /><Route path="/exchanges" element={<Protected><Exchanges /></Protected>} /><Route path="/notifications" element={<Protected><Notifications /></Protected>} /><Route path="*" element={<Navigate to="/" replace />} /></Routes></AuthProvider>;
+  return <AuthProvider><Routes><Route path="/" element={<Landing />} /><Route path="/signup" element={<AuthPage mode="signup" />} /><Route path="/signin" element={<AuthPage mode="signin" />} /><Route path="/app" element={<Protected><Dashboard /></Protected>} /><Route path="/discover" element={<Protected><SearchPeople /></Protected>} /><Route path="/search" element={<Protected><SearchPeople /></Protected>} /><Route path="/profile/:id" element={<Protected><Profile /></Protected>} /><Route path="/my-profile" element={<Protected><Profile own /></Protected>} /><Route path="/edit-profile" element={<Protected><EditProfile /></Protected>} /><Route path="/friends" element={<Protected><Friends /></Protected>} /><Route path="/chats" element={<Protected><Chats /></Protected>} /><Route path="/chats/:userId" element={<Protected><Chats /></Protected>} /><Route path="/requests" element={<Protected><ConnectionRequests /></Protected>} /><Route path="/exchanges" element={<Protected><Exchanges /></Protected>} /><Route path="/notifications" element={<Protected><Notifications /></Protected>} /><Route path="*" element={<Navigate to="/" replace />} /></Routes></AuthProvider>;
 }
 
 // Start the website with browser URL routing enabled.
