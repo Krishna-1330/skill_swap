@@ -51,8 +51,23 @@ const notificationSchema = new Schema({
   relatedRequestId: { type: Schema.Types.ObjectId }
 }, { timestamps: true });
 
+// Chat messages and small PDF handouts stay in MongoDB with the rest of the history.
+const chatMessageSchema = new Schema({
+  senderId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  receiverId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  text: { type: String, default: '', trim: true, maxlength: 5000 },
+  pdfName: { type: String, default: '', maxlength: 120 },
+  pdfSize: { type: Number, default: 0 },
+  pdfData: { type: Buffer, default: undefined, select: false },
+  // Hiding a chat only removes it from that person's view; the other person keeps their history.
+  hiddenFor: [{ type: Schema.Types.ObjectId, ref: 'User', default: [] }]
+}, { timestamps: true });
+
+chatMessageSchema.index({ senderId: 1, receiverId: 1, createdAt: 1 });
+
 // Reuse registered models during local reloads and serverless warm starts.
 export const User = mongoose.models.User || model('User', userSchema);
 export const Connection = mongoose.models.Connection || model('Connection', connectionSchema);
 export const Exchange = mongoose.models.Exchange || model('Exchange', exchangeSchema);
 export const Notification = mongoose.models.Notification || model('Notification', notificationSchema);
+export const ChatMessage = mongoose.models.ChatMessage || model('ChatMessage', chatMessageSchema);

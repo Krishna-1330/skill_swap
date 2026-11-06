@@ -5,11 +5,12 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import mongoose from 'mongoose';
 import { connectDatabase } from './db.js';
-import { User, Connection, Exchange, Notification } from './models.js';
+import { User, Connection, Exchange, Notification, ChatMessage } from './models.js';
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '1mb' }));
+// The larger limit allows a small PDF to be sent as base64 JSON.
+app.use(express.json({ limit: '12mb' }));
 
 // Connect on demand so the same app works locally and on Render.
 app.use('/api', async (_req, res, next) => {
@@ -73,6 +74,24 @@ async function notify(userId, senderId, type, message, relatedRequestId) {
 
 function validId(id) {
   return mongoose.isValidObjectId(id);
+}
+
+const maxChatPdfBytes = 8 * 1024 * 1024;
+
+async function canChat(firstId, secondId) {
+  const pairKey = [String(firstId), String(secondId)].sort().join(':');
+  return Connection.exists({ pairKey, status: 'Accepted' });
+}
+
+function chatMessageView(message) {
+  return {
+    _id: message._id,
+    senderId: message.senderId,
+    receiverId: message.receiverId,
+    text: message.text,
+    pdf: message.pdfName ? { name: message.pdfName, size: message.pdfSize } : null,
+    createdAt: message.createdAt
+  };
 }
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'SkillSwap API' }));
@@ -262,6 +281,146 @@ app.delete('/api/connections/user/:id', auth(), async (req, res, next) => {
     const row = await Connection.findOneAndDelete({ pairKey, status: 'Accepted' });
     if (!row) return res.status(404).json({ message: 'Connection was not found.' });
     res.json({ message: 'Connection removed.' });
+  } catch (error) { next(error); }
+});
+
+// Chat history is available only to students whose connection request was accepted.
+app.get('/api/chats', auth(), async (req, res, next) => {
+  try {
+    const connections = await Connection.find({
+      status: 'Accepted',
+      $or: [{ senderId: req.userId }, { receiverId: req.userId }]
+    }).sort({ updatedAt: -1 });
+    const friendIds = connections.map((row) => String(row.senderId) === String(req.userId) ? row.receiverId : row.senderId);
+    const friends = await User.find({ _id: { $in: friendIds } });
+
+    // Load message previews only; PDF bytes are sent when a user downloads a file.
+    const history = await ChatMessage.find({
+      $or: [{ senderId: req.userId }, { receiverId: req.userId }],
+      hiddenFor: { $ne: req.userId }
+    }).sort({ createdAt: -1 }).select('senderId receiverId text pdfName createdAt').lean();
+    const latestByFriend = new Map();
+    for (const message of history) {
+      const otherId = String(message.senderId) === String(req.userId) ? String(message.receiverId) : String(message.senderId);
+      if (!latestByFriend.has(otherId)) latestByFriend.set(otherId, message);
+    }
+
+    const results = friends.map((friend) => {
+      const latest = latestByFriend.get(String(friend._id));
+      return {
+        ...publicUser(friend),
+        lastMessage: latest ? (latest.text || (latest.pdfName ? `PDF: ${latest.pdfName}` : '')) : '',
+        lastMessageAt: latest?.createdAt || null
+      };
+    }).sort((a, b) => new Date(b.lastMessageAt || 0) - new Date(a.lastMessageAt || 0));
+    res.json({ friends: results });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/chats/:userId/messages', auth(), async (req, res, next) => {
+  try {
+    const otherId = String(req.params.userId);
+    if (!validId(otherId) || otherId === String(req.userId)) return res.status(400).json({ message: 'Choose a valid student to chat with.' });
+    if (!await canChat(req.userId, otherId)) return res.status(403).json({ message: 'Chat is available after the connection is accepted.' });
+    const messages = await ChatMessage.find({
+      $or: [
+        { senderId: req.userId, receiverId: otherId },
+        { senderId: otherId, receiverId: req.userId }
+      ],
+      hiddenFor: { $ne: req.userId }
+    }).sort({ createdAt: 1 }).select('-pdfData').lean();
+    res.json({ messages: messages.map(chatMessageView) });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/chats/:userId/messages', auth(), async (req, res, next) => {
+  try {
+    const otherId = String(req.params.userId);
+    if (!validId(otherId) || otherId === String(req.userId)) return res.status(400).json({ message: 'Choose a valid student to chat with.' });
+    if (!await canChat(req.userId, otherId)) return res.status(403).json({ message: 'Chat is available after the connection is accepted.' });
+
+    const text = String(req.body.text || '').trim();
+    if (text.length > 5000) return res.status(400).json({ message: 'A message can have up to 5,000 characters.' });
+    let pdfData;
+    let pdfName = '';
+    let pdfSize = 0;
+
+    if (req.body.pdf) {
+      const rawBase64 = String(req.body.pdf.base64 || '').replace(/^data:application\/pdf;base64,/i, '');
+      pdfName = String(req.body.pdf.name || 'shared-document.pdf').replace(/[\\/\r\n"]/g, '_').trim().slice(0, 120);
+      if (!pdfName.toLowerCase().endsWith('.pdf')) return res.status(400).json({ message: 'Please choose a PDF file.' });
+      if (!rawBase64 || rawBase64.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(rawBase64)) {
+        return res.status(400).json({ message: 'The selected PDF could not be read. Please choose it again.' });
+      }
+      pdfData = Buffer.from(rawBase64, 'base64');
+      if (pdfData.length > maxChatPdfBytes) return res.status(413).json({ message: 'PDF files must be 8 MB or smaller.' });
+      if (pdfData.length < 5 || pdfData.subarray(0, 5).toString('ascii') !== '%PDF-') {
+        return res.status(400).json({ message: 'The selected file does not look like a PDF.' });
+      }
+      pdfSize = pdfData.length;
+    }
+    if (!text && !pdfData) return res.status(400).json({ message: 'Write a message or attach a PDF before sending.' });
+
+    const message = await ChatMessage.create({ senderId: req.userId, receiverId: otherId, text, pdfName, pdfSize, pdfData });
+    res.status(201).json({ message: chatMessageView(message) });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/chats/:userId/files/:messageId', auth(), async (req, res, next) => {
+  try {
+    const otherId = String(req.params.userId);
+    if (!validId(otherId) || !validId(req.params.messageId)) return res.status(400).json({ message: 'This chat file link is not valid.' });
+    if (!await canChat(req.userId, otherId)) return res.status(403).json({ message: 'This chat is no longer available.' });
+    const message = await ChatMessage.findOne({
+      _id: req.params.messageId,
+      $or: [
+        { senderId: req.userId, receiverId: otherId },
+        { senderId: otherId, receiverId: req.userId }
+      ],
+      hiddenFor: { $ne: req.userId }
+    }).select('+pdfData');
+    if (!message?.pdfData) return res.status(404).json({ message: 'This PDF is no longer available.' });
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': 'attachment; filename="shared-document.pdf"',
+      'Content-Length': message.pdfData.length,
+      'Cache-Control': 'private, no-store'
+    });
+    res.send(message.pdfData);
+  } catch (error) { next(error); }
+});
+
+app.delete('/api/chats/:userId/messages/:messageId', auth(), async (req, res, next) => {
+  try {
+    const otherId = String(req.params.userId);
+    if (!validId(otherId) || !validId(req.params.messageId)) return res.status(400).json({ message: 'This chat message link is not valid.' });
+    if (!await canChat(req.userId, otherId)) return res.status(403).json({ message: 'This chat is no longer available.' });
+    const message = await ChatMessage.findOneAndUpdate({
+      _id: req.params.messageId,
+      $or: [
+        { senderId: req.userId, receiverId: otherId },
+        { senderId: otherId, receiverId: req.userId }
+      ],
+      hiddenFor: { $ne: req.userId }
+    }, { $addToSet: { hiddenFor: req.userId } }, { new: true });
+    if (!message) return res.status(404).json({ message: 'This message was not found.' });
+    res.json({ message: 'Message deleted from your chat.' });
+  } catch (error) { next(error); }
+});
+
+app.delete('/api/chats/:userId', auth(), async (req, res, next) => {
+  try {
+    const otherId = String(req.params.userId);
+    if (!validId(otherId) || otherId === String(req.userId)) return res.status(400).json({ message: 'Choose a valid chat.' });
+    if (!await canChat(req.userId, otherId)) return res.status(403).json({ message: 'This chat is no longer available.' });
+    await ChatMessage.updateMany({
+      $or: [
+        { senderId: req.userId, receiverId: otherId },
+        { senderId: otherId, receiverId: req.userId }
+      ],
+      hiddenFor: { $ne: req.userId }
+    }, { $addToSet: { hiddenFor: req.userId } });
+    res.json({ message: 'Chat history cleared from your view.' });
   } catch (error) { next(error); }
 });
 
